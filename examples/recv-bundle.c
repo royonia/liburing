@@ -12,14 +12,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <assert.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/un.h>
 #include <sys/mman.h>
 #include <liburing.h>
-#include <pthread.h>
-#include <stdatomic.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -30,18 +26,22 @@
 #define BUFFER_COUNT 4             /* Number of buffers in the ring */
 #define QUEUE_DEPTH 64             /* io_uring queue depth */
 
+#define min(a, b) (((a) < (b)) ? (a) : (b))
+
 /* Global state tracking */
-atomic_size_t data_received = 0;   /* Tracks total bytes received */
-atomic_bool task_completed = false; /* Signals test completion */
+size_t data_received = 0;   /* Tracks total bytes received */
+
+/* Function prototypes */
+void write_all(int fd, const void *data, size_t size);
 
 /**
  * Buffer data structure
  * Contains information about a buffer from the ring
  */
 struct buf_data {
-    void *addr;      /* Buffer memory address */
-    uint16_t bid;    /* Buffer ID within the ring */
-    uint32_t len;    /* Length of valid data in the buffer */
+    void     *addr;  /* Buffer memory address */
+    uint16_t  bid;   /* Buffer ID within the ring */
+    uint32_t  len;   /* Length of valid data in the buffer */
 };
 
 /**
@@ -50,9 +50,9 @@ struct buf_data {
  */
 struct buf_ring_data {
     struct io_uring_buf_ring *buf_ring;  /* The io_uring buffer ring */
-    void *buffer_memory;                 /* Memory for all buffers */
-    uint16_t ring_entries;              /* Number of entries in the ring */
-    uint32_t buf_size;                  /* Size of each buffer */
+    void                     *buffer_memory;  /* Memory for all buffers */
+    uint16_t                  ring_entries;   /* Number of entries in the ring */
+    uint32_t                  buf_size;       /* Size of each buffer */
 };
 
 /**
@@ -272,40 +272,57 @@ void process_completion(struct io_uring_cqe *cqe, struct buf_ring_data *br_data,
     
     /* Extract buffer ID and data length from completion */
     uint16_t bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-    uint32_t len = cqe->res;
+    uint32_t total_len = cqe->res;
+
+    uint32_t nr_packet = 0;
+    while (total_len) {
+        uint32_t this_len = min(BUFFER_SIZE, total_len);
+        /* should never get a len large then bundled buffer size */
+        assert(this_len <= BUFFER_SIZE);
+
+        /* Calculate address of this buffer in our memory pool */
+        void *buffer_addr = (char*)br_data->buffer_memory + (bid * BUFFER_SIZE);
+
+        /* Prepare buffer data structure for verification */
+        struct buf_data buf = {
+            .addr = buffer_addr,
+            .bid = bid,
+            .len = this_len
+        };
+        fprintf(stderr, "read buf[%d] len=%d\n", buf.bid, buf.len);
+
+        /* Update global counter of total bytes received */
+        data_received += this_len;
+
+        /* Log buffer information for debugging */
+        fprintf(stderr, "bid: [%u]/(%u)/(%p): \n", bid, this_len, buffer_addr);
+        for (int i = 0; i < 10 && i < this_len; i++) {
+            fprintf(stderr, "%u ", ((uint8_t*)buffer_addr)[i]);
+        }
+        fprintf(stderr, "...\n");
+
+        /* Verify received data against expected pattern */
+        verify_received_buffer(&buf, *current_expect);
+        *current_expect += this_len; /* Move expected pointer forward */
     
-    /* Calculate address of this buffer in our memory pool */
-    void *buffer_addr = (char*)br_data->buffer_memory + (bid * br_data->buf_size);
-    
-    /* Prepare buffer data structure for verification */
-    struct buf_data buf = {
-        .addr = buffer_addr,
-        .bid = bid,
-        .len = len
-    };
-    
-    /* Update global counter of total bytes received */
-    atomic_fetch_add(&data_received, len);
-    
-    /* Log buffer information for debugging */
-    fprintf(stderr, "bid: [%u]/(%u)/(%p): \n", bid, len, buffer_addr);
-    for (int i = 0; i < 10 && i < len; i++) {
-        fprintf(stderr, "%u ", ((uint8_t*)buffer_addr)[i]);
+        /* rearm the buffer */
+        fprintf(stderr, "rearming buf[%d]\n", bid);
+        io_uring_buf_ring_add(br_data->buf_ring, buffer_addr, BUFFER_SIZE, 
+                bid, io_uring_buf_ring_mask(br_data->ring_entries), 0);
+        nr_packet += 1;
+
+        /* Calculate next buffer id */
+        bid = (bid + 1) & (BUFFER_COUNT - 1);
+        total_len -= this_len;
     }
-    fprintf(stderr, "...\n");
-    
-    /* Verify received data against expected pattern */
-    verify_received_buffer(&buf, *current_expect);
-    *current_expect += len; /* Move expected pointer forward */
-    
-    /* Recycle the buffer by adding it back to the buffer ring */
-    io_uring_buf_ring_add(br_data->buf_ring, buffer_addr, br_data->buf_size, 
-                         bid, io_uring_buf_ring_mask(br_data->ring_entries), 0);
     
     /* Calculate slots to advance (ceiling division) and update the ring */
-    int advance_buf = (cqe->res + br_data->buf_size - 1) / br_data->buf_size;
-    fprintf(stderr, "io_uring_buf_ring_advance: %d\n", advance_buf);
-    io_uring_buf_ring_advance(br_data->buf_ring, advance_buf);
+    // int advance_buf = (cqe->res + br_data->buf_size - 1) / br_data->buf_size;
+    // fprintf(stderr, "io_uring_buf_ring_advance: %d\n", advance_buf);
+    // io_uring_buf_ring_advance(br_data->buf_ring, advance_buf);
+    /* Recycle the buffer by adding it back to the buffer ring */
+
+    io_uring_buf_ring_advance(br_data->buf_ring, nr_packet);
 }
 
 /**
@@ -347,13 +364,8 @@ int test_recv_multi_large_packet_isolate_ring() {
     }
     
     /* Send test data through the socket */
-    size_t bytes_sent = 0;
-    while (bytes_sent < ONE_MB) {
-        ssize_t sent = write(sender_fd, test_data + bytes_sent, ONE_MB - bytes_sent);
-        assert(sent > 0);
-	fprintf(stderr, "send: %ld bytes\n", sent);
-        bytes_sent += sent;
-    }
+    write_all(sender_fd, test_data, ONE_MB);
+    fprintf(stderr, "sent %d bytes", ONE_MB);
     
     /* Close sender side to signal EOF to receiver */
     close(sender_fd);
@@ -381,7 +393,7 @@ int test_recv_multi_large_packet_isolate_ring() {
     int poll_count = 0;
     
     /* Loop until we've received all data or exceed maximum iterations */
-    while (atomic_load(&data_received) < ONE_MB && poll_count < 5000) {
+    while (data_received < ONE_MB && poll_count < 5000) {
         /* Wait for a completion event */
         ret = io_uring_wait_cqe(&ring, &cqe);
         if (ret == 0) {
@@ -418,15 +430,14 @@ int test_recv_multi_large_packet_isolate_ring() {
         
         /* Periodically log progress (every 1000 iterations) */
         if (poll_count % 1000 == 0) {
-            size_t current = atomic_load(&data_received);
-            fprintf(stderr, "[Main] After %d iterations: received %zu bytes\n", poll_count, current);
+            fprintf(stderr, "[Main] After %d iterations: received %zu bytes\n", poll_count, data_received);
         }
         
         poll_count++;
     }
     
     /* Verify we received all expected data */
-    size_t total_received = atomic_load(&data_received);
+    size_t total_received = data_received;
     fprintf(stderr, "Total received: %zu bytes, expected: %d bytes\n", total_received, ONE_MB);
     assert(total_received == ONE_MB);  /* Test fails if we didn't receive all data */
     
@@ -444,12 +455,35 @@ int test_recv_multi_large_packet_isolate_ring() {
 }
 
 /**
+ * Writes all the data to the specified file descriptor
+ *
+ * This function ensures that all data is written, handling partial writes
+ * by making repeated calls to write() until all bytes are sent.
+ *
+ * @param fd File descriptor to write to
+ * @param data Pointer to the data buffer to write
+ * @param size Number of bytes to write
+ */
+void write_all(int fd, const void *data, size_t size) {
+    const uint8_t *buf = data;
+    size_t bytes_sent = 0;
+    
+    /* Continue until all data is sent */
+    while (bytes_sent < size) {
+        ssize_t sent = write(fd, buf + bytes_sent, size - bytes_sent);
+        assert(sent > 0);  /* Ensure write succeeded */
+        bytes_sent += sent;
+    } 
+}
+
+/**
  * Main entry point
  *
  * Simply prints a message and runs the test function.
  *
  * @param argc Command line argument count (unused)
  * @param argv Command line arguments (unused)
+ * @return 0 on success, non-zero on failure
  * @return 0 on success, non-zero on failure
  */
 int main(int argc, char *argv[]) {
