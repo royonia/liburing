@@ -23,10 +23,22 @@
 /* Configuration constants */
 #define ONE_MB      (1024 * 1024)  /* Size of test data (1MB) */
 #define BUFFER_SIZE 1024           /* Size of each buffer in bytes */
+
 #define BUFFER_COUNT 4             /* Number of buffers in the ring */
-#define QUEUE_DEPTH 64             /* io_uring queue depth */
+#define QUEUE_DEPTH 16             /* io_uring queue depth */
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
+
+/* Get the system page size */
+#define PAGE_SIZE sysconf(_SC_PAGESIZE)
+#define IS_PAGE_ALIGNED(addr) (((uintptr_t)(addr) & (PAGE_SIZE - 1)) == 0)
+
+/* Macros to check alignment for different data types */
+#define IS_ALIGNED(addr, bytes) (((uintptr_t)(addr) & (bytes - 1)) == 0)
+#define IS_2BYTE_ALIGNED(addr) IS_ALIGNED(addr, 2)
+#define IS_4BYTE_ALIGNED(addr) IS_ALIGNED(addr, 4)
+#define IS_8BYTE_ALIGNED(addr) IS_ALIGNED(addr, 8)
+#define IS_16BYTE_ALIGNED(addr) IS_ALIGNED(addr, 16)
 
 /* Global state tracking */
 size_t data_received = 0;   /* Tracks total bytes received */
@@ -182,6 +194,9 @@ struct buf_ring_data setup_buf_ring(struct io_uring *ring, uint16_t entries, uin
     void *buffer_memory = mmap(NULL, aligned_size, PROT_READ | PROT_WRITE, 
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(buffer_memory != MAP_FAILED);
+    
+    /* Verify buffer memory is page-aligned as guaranteed by mmap */
+    assert(IS_PAGE_ALIGNED(buffer_memory));
     result.buffer_memory = buffer_memory;
     
     /* Allocate and setup buffer ring with page alignment */
@@ -276,12 +291,18 @@ void process_completion(struct io_uring_cqe *cqe, struct buf_ring_data *br_data,
 
     uint32_t nr_packet = 0;
     while (total_len) {
+        nr_packet += 1;
         uint32_t this_len = min(BUFFER_SIZE, total_len);
         /* should never get a len large then bundled buffer size */
         assert(this_len <= BUFFER_SIZE);
 
-        /* Calculate address of this buffer in our memory pool */
-        void *buffer_addr = (char*)br_data->buffer_memory + (bid * BUFFER_SIZE);
+        /* Calculate address of this buffer in our memory pool with proper alignment */
+        void *buffer_addr = (uint8_t*)br_data->buffer_memory + (bid * BUFFER_SIZE);
+        
+        /* Verify buffer alignment for debugging */
+        if (!IS_8BYTE_ALIGNED(buffer_addr)) {
+            fprintf(stderr, "WARNING: Buffer address %p is not page aligned\n", buffer_addr);
+        }
 
         /* Prepare buffer data structure for verification */
         struct buf_data buf = {
@@ -309,20 +330,16 @@ void process_completion(struct io_uring_cqe *cqe, struct buf_ring_data *br_data,
         fprintf(stderr, "rearming buf[%d]\n", bid);
         io_uring_buf_ring_add(br_data->buf_ring, buffer_addr, BUFFER_SIZE, 
                 bid, io_uring_buf_ring_mask(br_data->ring_entries), 0);
-        nr_packet += 1;
 
         /* Calculate next buffer id */
         bid = (bid + 1) & (BUFFER_COUNT - 1);
         total_len -= this_len;
+        io_uring_buf_ring_advance(br_data->buf_ring, 1);
     }
-    
-    /* Calculate slots to advance (ceiling division) and update the ring */
-    // int advance_buf = (cqe->res + br_data->buf_size - 1) / br_data->buf_size;
-    // fprintf(stderr, "io_uring_buf_ring_advance: %d\n", advance_buf);
-    // io_uring_buf_ring_advance(br_data->buf_ring, advance_buf);
-    /* Recycle the buffer by adding it back to the buffer ring */
-
-    io_uring_buf_ring_advance(br_data->buf_ring, nr_packet);
+    // if (nr_packet) {
+    //     fprintf(stderr, "io_uring_buf_ring_advance: %d\n", nr_packet);
+    //     io_uring_buf_ring_advance(br_data->buf_ring, nr_packet);
+    // }
 }
 
 /**
