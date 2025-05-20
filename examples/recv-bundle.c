@@ -291,13 +291,22 @@ void process_completion(struct io_uring_cqe *cqe, struct buf_ring_data *br_data,
 
     uint32_t nr_packet = 0;
     while (total_len) {
-        nr_packet += 1;
         uint32_t this_len = min(BUFFER_SIZE, total_len);
         /* should never get a len large then bundled buffer size */
         assert(this_len <= BUFFER_SIZE);
 
         /* Calculate address of this buffer in our memory pool with proper alignment */
         void *buffer_addr = (uint8_t*)br_data->buffer_memory + (bid * BUFFER_SIZE);
+        
+        /* Extra careful buffer addr to make sure buffer_id ordering */
+        // struct io_uring_buf *this_iobuf = (struct io_uring_buf*)(&br_data->buf_ring->bufs[bid]);
+        // void *buffer_addr = (uint8_t*)this_iobuf->addr;
+        // uint16_t next_bid = (bid + 1) & (BUFFER_COUNT - 1);
+        // struct io_uring_buf *next_iobuf = (struct io_uring_buf*)(&br_data->buf_ring->bufs[next_bid]);
+        // fprintf(stderr, "thisbuf->bid: %d\n", this_iobuf->bid);
+        // fprintf(stderr, "nextbuf->bid: %d\n", next_iobuf->bid);
+        // assert(this_iobuf->bid == bid);
+        // assert(next_iobuf->bid == next_bid);
         
         /* Verify buffer alignment for debugging */
         if (!IS_8BYTE_ALIGNED(buffer_addr)) {
@@ -329,17 +338,18 @@ void process_completion(struct io_uring_cqe *cqe, struct buf_ring_data *br_data,
         /* rearm the buffer */
         fprintf(stderr, "rearming buf[%d]\n", bid);
         io_uring_buf_ring_add(br_data->buf_ring, buffer_addr, BUFFER_SIZE, 
-                bid, io_uring_buf_ring_mask(br_data->ring_entries), 0);
+                bid, io_uring_buf_ring_mask(br_data->ring_entries), nr_packet);
+        nr_packet += 1;
 
         /* Calculate next buffer id */
         bid = (bid + 1) & (BUFFER_COUNT - 1);
         total_len -= this_len;
-        io_uring_buf_ring_advance(br_data->buf_ring, 1);
+        // io_uring_buf_ring_advance(br_data->buf_ring, 1);
     }
-    // if (nr_packet) {
-    //     fprintf(stderr, "io_uring_buf_ring_advance: %d\n", nr_packet);
-    //     io_uring_buf_ring_advance(br_data->buf_ring, nr_packet);
-    // }
+    if (nr_packet) {
+        fprintf(stderr, "io_uring_buf_ring_advance: %d\n", nr_packet);
+        io_uring_buf_ring_advance(br_data->buf_ring, nr_packet);
+    }
 }
 
 /**
