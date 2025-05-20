@@ -35,10 +35,7 @@
 
 /* Macros to check alignment for different data types */
 #define IS_ALIGNED(addr, bytes) (((uintptr_t)(addr) & (bytes - 1)) == 0)
-#define IS_2BYTE_ALIGNED(addr) IS_ALIGNED(addr, 2)
-#define IS_4BYTE_ALIGNED(addr) IS_ALIGNED(addr, 4)
 #define IS_8BYTE_ALIGNED(addr) IS_ALIGNED(addr, 8)
-#define IS_16BYTE_ALIGNED(addr) IS_ALIGNED(addr, 16)
 
 /* Global state tracking */
 size_t data_received = 0;   /* Tracks total bytes received */
@@ -335,7 +332,7 @@ void process_completion(struct io_uring_cqe *cqe, struct buf_ring_data *br_data,
         verify_received_buffer(&buf, *current_expect);
         *current_expect += this_len; /* Move expected pointer forward */
     
-        /* rearm the buffer */
+        /* Rearm the buffer */
         fprintf(stderr, "rearming buf[%d]\n", bid);
         io_uring_buf_ring_add(br_data->buf_ring, buffer_addr, BUFFER_SIZE, 
                 bid, io_uring_buf_ring_mask(br_data->ring_entries), nr_packet);
@@ -344,7 +341,6 @@ void process_completion(struct io_uring_cqe *cqe, struct buf_ring_data *br_data,
         /* Calculate next buffer id */
         bid = (bid + 1) & (BUFFER_COUNT - 1);
         total_len -= this_len;
-        // io_uring_buf_ring_advance(br_data->buf_ring, 1);
     }
     if (nr_packet) {
         fprintf(stderr, "io_uring_buf_ring_advance: %d\n", nr_packet);
